@@ -1,24 +1,36 @@
 import React, { useEffect, useState } from "react";
 
-// Daily Study Timer with:
+// Daily Study Tracker with:
 // - Continuous daily timer (start/pause)
 // - JSON persistence in localStorage
-// - Simple Todo list
-// - Weekly dashboard (last 7 days total + progress bar)
+// - Study To-Dos
+// - Weekly dashboard (last 7 days)
+// - Daily goal & progress
+// - Weekly goal (editable)
+// - Current session timer
+// - Streak counter
 
-const STORAGE_KEY = "study_timer_data_v2";
-const WEEKLY_GOAL_HOURS = 20; // change this if you want a different weekly goal
+const STORAGE_KEY = "study_timer_data_v3";
+const PRODUCTIVE_MINUTES_FOR_STREAK = 30; // min minutes per day to count as a "productive" day
 
 function getDateKey(timestamp = Date.now()) {
   return new Date(timestamp).toISOString().slice(0, 10); // YYYY-MM-DD
 }
 
+function getDefaultSettings() {
+  return {
+    dailyGoalMinutes: 240, // 4 hours
+    weeklyGoalHours: 20,
+  };
+}
+
 function getEmptyData() {
   return {
-    version: 2,
+    version: 3,
     days: {}, // { [dateKey]: { segments: [{ start, end }] } }
     currentSession: null, // { dateKey, start }
     todos: [], // { id, text, done }
+    settings: getDefaultSettings(),
   };
 }
 
@@ -30,14 +42,20 @@ function loadInitialData() {
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return getEmptyData();
 
-    // Very light validation + backwards safety
     if (!parsed.days || typeof parsed.days !== "object") {
       parsed.days = {};
     }
     if (!Array.isArray(parsed.todos)) {
       parsed.todos = [];
     }
-    parsed.version = 2;
+    if (!parsed.settings || typeof parsed.settings !== "object") {
+      parsed.settings = getDefaultSettings();
+    } else {
+      // fill missing setting fields
+      const defaults = getDefaultSettings();
+      parsed.settings = { ...defaults, ...parsed.settings };
+    }
+    parsed.version = 3;
 
     return parsed;
   } catch (e) {
@@ -85,6 +103,46 @@ function getTotalMsForDate(data, dateKey, now) {
   return total;
 }
 
+function getCurrentSessionMs(data, now) {
+  if (!data.currentSession) return 0;
+  return Math.max(0, now - data.currentSession.start);
+}
+
+function getPrettyDateLabel(dateKey, todayKey) {
+  if (dateKey === todayKey) return "Today";
+
+  const today = new Date(todayKey);
+  const d = new Date(dateKey);
+  const diffDays = Math.round(
+    (today.setHours(0, 0, 0, 0) - d.setHours(0, 0, 0, 0)) /
+      (1000 * 60 * 60 * 24)
+  );
+
+  if (diffDays === 1) return "Yesterday";
+  return dateKey;
+}
+
+function computeCurrentStreak(data, now) {
+  const todayKey = getDateKey(now);
+  const thresholdMs = PRODUCTIVE_MINUTES_FOR_STREAK * 60 * 1000;
+  let streak = 0;
+
+  const d = new Date(todayKey);
+  // Try up to 365 days back just to be safe
+  for (let i = 0; i < 365; i++) {
+    const dateKey = d.toISOString().slice(0, 10);
+    const totalMs = getTotalMsForDate(data, dateKey, now);
+    if (totalMs >= thresholdMs) {
+      streak += 1;
+      d.setDate(d.getDate() - 1);
+    } else {
+      break;
+    }
+  }
+
+  return streak;
+}
+
 export default function App() {
   const [data, setData] = useState(() => loadInitialData());
   const [now, setNow] = useState(Date.now());
@@ -105,14 +163,49 @@ export default function App() {
 
   const todayKey = getDateKey(now);
   const isRunning = !!data.currentSession;
+  const todayTotalMs = getTotalMsForDate(data, todayKey, now);
+  const currentSessionMs = getCurrentSessionMs(data, now);
 
+  // History and weekly stats
+  const allDateKeys = Object.keys(data.days).sort((a, b) =>
+    a < b ? 1 : a > b ? -1 : 0
+  );
+  const historyItems = allDateKeys.slice(0, 7).map((dateKey) => {
+    const totalMs = getTotalMsForDate(data, dateKey, now);
+    return { dateKey, totalMs };
+  });
+
+  const weeklyTotalMs = historyItems.reduce(
+    (sum, item) => sum + item.totalMs,
+    0
+  );
+
+  const dailyGoalMinutes = data.settings?.dailyGoalMinutes ?? 240;
+  const weeklyGoalHours = data.settings?.weeklyGoalHours ?? 20;
+
+  const dailyGoalMs = dailyGoalMinutes * 60 * 1000;
+  const weeklyGoalMs = weeklyGoalHours * 60 * 60 * 1000;
+
+  const dailyProgress = dailyGoalMs
+    ? Math.min(100, Math.round((todayTotalMs / dailyGoalMs) * 100))
+    : 0;
+  const weeklyProgress = weeklyGoalMs
+    ? Math.min(100, Math.round((weeklyTotalMs / weeklyGoalMs) * 100))
+    : 0;
+
+  const currentStreak = computeCurrentStreak(data, now);
+
+  // Handlers
   const handleStart = () => {
     if (isRunning) return; // already running
     const startTime = Date.now();
     const dateKey = getDateKey(startTime);
 
     setData((prev) => {
-      const next = { ...prev, days: { ...prev.days } };
+      const next = {
+        ...prev,
+        days: { ...prev.days },
+      };
       if (!next.days[dateKey]) {
         next.days[dateKey] = { segments: [] };
       }
@@ -199,40 +292,39 @@ export default function App() {
     }));
   };
 
-  const todayTotalMs = getTotalMsForDate(data, todayKey, now);
+  const clearCompletedTodos = () => {
+    setData((prev) => ({
+      ...prev,
+      todos: (prev.todos || []).filter((t) => !t.done),
+    }));
+  };
 
-  // Build a simple history list (last 7 days including today)
-  const allDateKeys = Object.keys(data.days).sort((a, b) =>
-    a < b ? 1 : a > b ? -1 : 0
-  );
+  const handleDailyGoalChange = (e) => {
+    const value = Number(e.target.value);
+    if (Number.isNaN(value)) return;
+    const minutes = Math.max(0, Math.min(24 * 60, value)); // 0 to 1440
+    setData((prev) => ({
+      ...prev,
+      settings: {
+        ...getDefaultSettings(),
+        ...(prev.settings || {}),
+        dailyGoalMinutes: minutes,
+      },
+    }));
+  };
 
-  const historyItems = allDateKeys.slice(0, 7).map((dateKey) => {
-    const totalMs = getTotalMsForDate(data, dateKey, now);
-    return { dateKey, totalMs };
-  });
-
-  const weeklyTotalMs = historyItems.reduce(
-    (sum, item) => sum + item.totalMs,
-    0
-  );
-
-  const weeklyGoalMs = WEEKLY_GOAL_HOURS * 60 * 60 * 1000;
-  const weeklyProgress = weeklyGoalMs
-    ? Math.min(100, Math.round((weeklyTotalMs / weeklyGoalMs) * 100))
-    : 0;
-
-  const prettyDateLabel = (dateKey) => {
-    if (dateKey === todayKey) return "Today";
-
-    const today = new Date(todayKey);
-    const d = new Date(dateKey);
-    const diffDays = Math.round(
-      (today.setHours(0, 0, 0, 0) - d.setHours(0, 0, 0, 0)) /
-        (1000 * 60 * 60 * 24)
-    );
-
-    if (diffDays === 1) return "Yesterday";
-    return dateKey;
+  const handleWeeklyGoalChange = (e) => {
+    const value = Number(e.target.value);
+    if (Number.isNaN(value)) return;
+    const hours = Math.max(0, Math.min(168, value)); // 0 to 168
+    setData((prev) => ({
+      ...prev,
+      settings: {
+        ...getDefaultSettings(),
+        ...(prev.settings || {}),
+        weeklyGoalHours: hours,
+      },
+    }));
   };
 
   const completedTodos = (data.todos || []).filter((t) => t.done).length;
@@ -243,14 +335,20 @@ export default function App() {
       <div className="timer-card">
         <h1 className="app-title">Daily Study Tracker</h1>
         <p className="app-subtitle">
-          Start when you study, pause for breaks, track your tasks, and see your
-          weekly progress.
+          Track your actual study time, manage tasks, and see your daily & weekly
+          progress.
         </p>
 
         <div className="timer-display">{formatDuration(todayTotalMs)}</div>
         <div className="timer-label">
           {isRunning ? "Tracking study time..." : "Paused"}
         </div>
+        {isRunning && (
+          <div className="session-label">
+            Current session:{" "}
+            <strong>{formatDuration(currentSessionMs)}</strong>
+          </div>
+        )}
 
         <div className="controls">
           <button
@@ -268,6 +366,52 @@ export default function App() {
           </button>
         </div>
 
+        <div className="goals-row">
+          <div className="goal-block">
+            <div className="goal-header">
+              <span>Daily goal</span>
+              <input
+                type="number"
+                className="goal-input"
+                value={dailyGoalMinutes}
+                onChange={handleDailyGoalChange}
+              />
+              <span className="goal-unit">min</span>
+            </div>
+            <div className="progress-bar-track thin">
+              <div
+                className="progress-bar-fill"
+                style={{ width: `${dailyProgress}%` }}
+              />
+            </div>
+            <div className="goal-label">
+              {dailyProgress}% of daily goal
+            </div>
+          </div>
+
+          <div className="goal-block">
+            <div className="goal-header">
+              <span>Weekly goal</span>
+              <input
+                type="number"
+                className="goal-input"
+                value={weeklyGoalHours}
+                onChange={handleWeeklyGoalChange}
+              />
+              <span className="goal-unit">h</span>
+            </div>
+            <div className="progress-bar-track thin">
+              <div
+                className="progress-bar-fill blue"
+                style={{ width: `${weeklyProgress}%` }}
+              />
+            </div>
+            <div className="goal-label">
+              {weeklyProgress}% of weekly goal
+            </div>
+          </div>
+        </div>
+
         <div className="today-summary">
           <h2>Today</h2>
           <p>
@@ -275,15 +419,22 @@ export default function App() {
             far on <strong>{todayKey}</strong>.
           </p>
           <p className="tip">
-            Tip: Keep this tab open while studying. Just hit "Pause for Break"
-            when you stop.
+            Tip: Keep this tab open while studying. Hit "Pause for Break" when
+            you stop.
+          </p>
+          <p className="streak">
+            Current streak:{" "}
+            <strong>{currentStreak}</strong>{" "}
+            {currentStreak === 1 ? "day" : "days"} (≥{" "}
+            {PRODUCTIVE_MINUTES_FOR_STREAK} min/day)
           </p>
         </div>
 
         <div className="layout-split">
+          {/* TODO section */}
           <section className="todo-section">
             <div className="section-header">
-              <h2>Study To‑Dos</h2>
+              <h2>Study To-Dos</h2>
               <span className="todo-count">
                 {completedTodos}/{totalTodos} done
               </span>
@@ -302,9 +453,22 @@ export default function App() {
               </button>
             </form>
 
+            <div className="todo-actions">
+              <button
+                className="btn small"
+                type="button"
+                onClick={clearCompletedTodos}
+                disabled={completedTodos === 0}
+              >
+                Clear completed
+              </button>
+            </div>
+
             <ul className="todo-list">
               {(data.todos || []).length === 0 && (
-                <li className="todo-empty">No tasks yet. Add your first one.</li>
+                <li className="todo-empty">
+                  No tasks yet. Add your first one.
+                </li>
               )}
               {(data.todos || []).map((todo) => (
                 <li
@@ -332,16 +496,13 @@ export default function App() {
             </ul>
           </section>
 
+          {/* Weekly section */}
           <section className="weekly-section">
             <h2>Weekly Dashboard</h2>
             <p className="weekly-text">
-              Last 7 days total: <strong>{formatDuration(weeklyTotalMs)}</strong>
+              Last 7 days total:{" "}
+              <strong>{formatDuration(weeklyTotalMs)}</strong>
             </p>
-            <p className="weekly-text">
-              Weekly goal: {WEEKLY_GOAL_HOURS}h (
-              {formatDuration(weeklyGoalMs)})
-            </p>
-
             <div className="progress-bar-wrapper">
               <div className="progress-bar-track">
                 <div
@@ -363,7 +524,7 @@ export default function App() {
                   {historyItems.map((item) => (
                     <li key={item.dateKey} className="history-item">
                       <span className="history-date">
-                        {prettyDateLabel(item.dateKey)}
+                        {getPrettyDateLabel(item.dateKey, todayKey)}
                       </span>
                       <span className="history-time">
                         {formatDuration(item.totalMs)}
@@ -393,7 +554,7 @@ export default function App() {
           background: #020617;
           border-radius: 24px;
           padding: 24px 24px 20px;
-          max-width: 900px;
+          max-width: 980px;
           width: 100%;
           box-shadow: 0 20px 40px rgba(15, 23, 42, 0.8);
           border: 1px solid rgba(148, 163, 184, 0.2);
@@ -424,14 +585,21 @@ export default function App() {
           text-align: center;
           font-size: 13px;
           color: #9ca3af;
-          margin-bottom: 16px;
+          margin-bottom: 4px;
+        }
+
+        .session-label {
+          text-align: center;
+          font-size: 12px;
+          color: #a5b4fc;
+          margin-bottom: 12px;
         }
 
         .controls {
           display: flex;
           gap: 8px;
           justify-content: center;
-          margin-bottom: 20px;
+          margin-bottom: 16px;
           flex-wrap: wrap;
         }
 
@@ -490,6 +658,80 @@ export default function App() {
           transform: none;
         }
 
+        .goals-row {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 12px;
+          margin-bottom: 12px;
+        }
+
+        .goal-block {
+          padding: 10px;
+          border-radius: 14px;
+          background: rgba(15, 23, 42, 0.98);
+          border: 1px solid rgba(31, 41, 55, 0.9);
+          font-size: 12px;
+        }
+
+        .goal-header {
+          display: flex;
+          align-items: center;
+          gap: 4px;
+          margin-bottom: 4px;
+        }
+
+        .goal-input {
+          width: 64px;
+          border-radius: 999px;
+          border: 1px solid rgba(55, 65, 81, 0.9);
+          background: #020617;
+          padding: 2px 6px;
+          font-size: 12px;
+          color: #e5e7eb;
+          text-align: right;
+        }
+
+        .goal-input:focus {
+          outline: none;
+          border-color: #22c55e;
+          box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.5);
+        }
+
+        .goal-unit {
+          color: #9ca3af;
+        }
+
+        .progress-bar-track {
+          flex: 1;
+          height: 8px;
+          border-radius: 999px;
+          background: #020617;
+          border: 1px solid rgba(55, 65, 81, 0.9);
+          overflow: hidden;
+        }
+
+        .progress-bar-track.thin {
+          height: 6px;
+          margin-bottom: 2px;
+        }
+
+        .progress-bar-fill {
+          height: 100%;
+          border-radius: 999px;
+          background: linear-gradient(90deg, #22c55e, #3b82f6);
+          transition: width 0.2s ease;
+        }
+
+        .progress-bar-fill.blue {
+          background: linear-gradient(90deg, #3b82f6, #22c55e);
+        }
+
+        .goal-label {
+          margin-top: 2px;
+          font-size: 11px;
+          color: #9ca3af;
+        }
+
         .today-summary {
           margin-bottom: 16px;
           padding: 12px 12px 10px;
@@ -513,6 +755,12 @@ export default function App() {
         .today-summary .tip {
           font-size: 12px;
           color: #9ca3af;
+        }
+
+        .today-summary .streak {
+          font-size: 12px;
+          color: #a5b4fc;
+          margin-top: 4px;
         }
 
         .layout-split {
@@ -551,7 +799,7 @@ export default function App() {
         .todo-form {
           display: flex;
           gap: 6px;
-          margin-bottom: 8px;
+          margin-bottom: 6px;
         }
 
         .todo-input {
@@ -574,11 +822,17 @@ export default function App() {
           box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.5);
         }
 
+        .todo-actions {
+          display: flex;
+          justify-content: flex-end;
+          margin-bottom: 6px;
+        }
+
         .todo-list {
           list-style: none;
           margin: 0;
           padding: 0;
-          max-height: 160px;
+          max-height: 180px;
           overflow-y: auto;
         }
 
@@ -641,22 +895,6 @@ export default function App() {
           margin: 6px 0 10px;
         }
 
-        .progress-bar-track {
-          flex: 1;
-          height: 8px;
-          border-radius: 999px;
-          background: #020617;
-          border: 1px solid rgba(55, 65, 81, 0.9);
-          overflow: hidden;
-        }
-
-        .progress-bar-fill {
-          height: 100%;
-          border-radius: 999px;
-          background: linear-gradient(90deg, #22c55e, #3b82f6);
-          transition: width 0.2s ease;
-        }
-
         .progress-label {
           font-size: 12px;
           color: #9ca3af;
@@ -715,6 +953,10 @@ export default function App() {
           }
 
           .layout-split {
+            grid-template-columns: 1fr;
+          }
+
+          .goals-row {
             grid-template-columns: 1fr;
           }
         }
